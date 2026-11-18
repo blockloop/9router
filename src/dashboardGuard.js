@@ -13,7 +13,9 @@ async function getCliToken() {
   return cachedCliToken;
 }
 
-async function hasValidCliToken(request) {
+// Exported for the /v1 engine: a dashboard-internal request (the model "Test"
+// button's self-fetch) proves itself with this machine token, not a user API key.
+export async function hasValidCliToken(request) {
   const token = request.headers.get(CLI_TOKEN_HEADER);
   if (!token) return false;
   return token === await getCliToken();
