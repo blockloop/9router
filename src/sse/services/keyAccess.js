@@ -26,6 +26,7 @@ import { getApiKeyByKey } from "@/lib/db/repos/apiKeysRepo.js";
 import { getCombos } from "@/lib/db/repos/combosRepo.js";
 import { getModelInfo, getComboModels } from "./model.js";
 import { resolveProviderId } from "@/shared/constants/providers.js";
+import { hasValidCliToken } from "@/dashboardGuard.js";
 import {
   KEY_ACCESS_COMBO_OWNER,
   KEY_ACCESS_PROVIDER_AS_MODEL_KINDS,
@@ -37,6 +38,15 @@ import * as log from "../utils/logger.js";
 
 const lower = (s) => String(s).toLowerCase();
 const canonicalModel = (provider, model) => lower(`${provider}/${model}`);
+
+async function isDashboardInternalRequest(request) {
+  try {
+    return await hasValidCliToken(request);
+  } catch {
+    // Fail closed: an unreadable token is not proof of a dashboard-internal call.
+    return false;
+  }
+}
 
 /**
  * The client key, read from the same places and in the same order as the
@@ -68,6 +78,11 @@ export function extractClientApiKey(request) {
  * decides what an identified key may call.
  */
 export async function getKeyAccessContext(request) {
+  // A dashboard-internal call (model "Test", provider ping) authenticates with
+  // the machine CLI token, which the guard accepts as this host. There is no
+  // user key behind it, so per-key allow lists do not apply: they describe what
+  // a handed-out key may call, not what the dashboard may test.
+  if (await isDashboardInternalRequest(request)) return null;
   const apiKey = extractClientApiKey(request);
   if (!apiKey) return null;
   const record = await getApiKeyByKey(apiKey);

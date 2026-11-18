@@ -21,6 +21,7 @@ vi.mock("@/lib/localDb", () => ({
 vi.mock("@/lib/db/repos/combosRepo.js", () => ({ getCombos: async () => fx.combos }));
 vi.mock("@/lib/db/repos/apiKeysRepo.js", () => ({ getApiKeyByKey: async (k) => fx.keys[k] || null }));
 vi.mock("@/sse/utils/logger.js", () => ({ warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() }));
+vi.mock("@/shared/utils/machineId", () => ({ getConsistentMachineId: async () => "cli-token" }));
 
 const engine = await import("../../src/sse/services/keyAccess.js");
 const helpers = await import("../../src/shared/utils/keyAccess.js");
@@ -204,6 +205,26 @@ describe("capacity-adapter models", () => {
       .toEqual(["openai/model-a", "openai/model-b"]);
     const ctxB = await ctxFor("sk-b");
     expect(await engine.filterAdapterModels(ctxB, ["openai/model-b", "openai/model-b"], ["openai/model-b"])).toEqual(["openai/model-b", "openai/model-b"]);
+  });
+});
+
+describe("dashboard-internal requests bypass per-key access", () => {
+  // The model "Test" button self-fetches /v1 with the machine CLI token, so the
+  // probe must not inherit a restricted user key's allow list.
+  const internal = () => new Request("http://localhost/v1/chat/completions", {
+    method: "POST",
+    headers: { "x-9r-cli-token": "cli-token" },
+  });
+  it("ignores the key on a CLI-token request", async () => {
+    expect(await engine.getKeyAccessContext(internal())).toBeNull();
+    expect(await engine.enforceKeyAccess(await engine.getKeyAccessContext(internal()), "cf/@cf/qwen/qwq-32b")).toBeNull();
+  });
+  it("still imposes the allow list when the CLI token is wrong or absent", async () => {
+    const bad = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "x-9r-cli-token": "nope", Authorization: "Bearer sk-empty" },
+    });
+    expect((await engine.enforceKeyAccess(await engine.getKeyAccessContext(bad), "cf/@cf/qwen/qwq-32b"))?.status).toBe(403);
   });
 });
 
