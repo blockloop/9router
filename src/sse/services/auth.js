@@ -1,6 +1,6 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, MODEL_LOCK_ALL } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
@@ -8,6 +8,28 @@ import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
+
+/**
+ * Cooldowns for connections with no DB row to hold a lock.
+ * The no-auth free providers get a synthetic "noauth" connection per request, so
+ * there is nothing to persist `modelLock_*` on. Without this the member is retried
+ * on every request and re-hits the upstream limit each time. In-process only:
+ * a restart clears it, which is acceptable for a free-tier meter.
+ * @type {Map<string, number>} `${connectionId}:${model}` → cooldown expiry (ms)
+ */
+const ephemeralLocks = new Map();
+
+function ephemeralLockKey(connectionId, model) {
+  return `${connectionId}:${model || MODEL_LOCK_ALL}`;
+}
+
+function isEphemeralLockActive(connectionId, model) {
+  const expiry = ephemeralLocks.get(ephemeralLockKey(connectionId, model));
+  if (expiry == null) return false;
+  if (expiry > Date.now()) return true;
+  ephemeralLocks.delete(ephemeralLockKey(connectionId, model));
+  return false;
+}
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
@@ -55,8 +77,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         pickedId = pickProxyPoolId(poolIds, strategy, providerId);
       }
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
+      const connectionId = `noauth:${providerId}`;
+      if (isEphemeralLockActive(connectionId, model)) {
+        log.info("AUTH", `${provider} | ${model || "all"} in local cooldown, skipping no-auth connection`);
+        const expiry = ephemeralLocks.get(ephemeralLockKey(connectionId, model));
+        const retryAfter = new Date(expiry).toISOString();
+        return {
+          allRateLimited: true,
+          retryAfter,
+          retryAfterHuman: formatRetryAfter(retryAfter),
+          lastError: `[429]: ${provider} free usage limit reached`,
+          lastErrorCode: 429
+        };
+      }
       return {
         id: "noauth",
+        connectionId,
         connectionName: "Public",
         isActive: true,
         accessToken: "public",
@@ -245,6 +281,16 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+  // Virtual no-auth connections have no DB row; keep their cooldown in-process.
+  // They still need to fall through to the next combo member, otherwise the combo
+  // stops on the first member's error instead of using the paid one behind it.
+  if (connectionId?.startsWith("noauth:")) {
+    const { shouldFallback, cooldownMs } = checkFallbackError(status, errorText, 0, resolveProviderId(provider));
+    if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
+    ephemeralLocks.set(ephemeralLockKey(connectionId, model), Date.now() + cooldownMs);
+    log.warn("AUTH", `${connectionId} locked ${model || "all"} for ${Math.round(cooldownMs / 1000)}s [${status}] (local)`);
+    return { shouldFallback: true, cooldownMs };
+  }
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
