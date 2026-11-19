@@ -62,6 +62,9 @@ export const ERROR_RULES = [
   // Intl gateway blocks affect the account/IP, so let the connection back off.
   { provider: "codebuddy-intl", text: "request illegal", backoff: true },
   { provider: "codebuddy-intl", text: "conversation id missing", backoff: true },
+  // OpenCode's free tier is a plan meter, not a burst limit: it stays blocked for
+  // the plan window, so a 2s exponential backoff would re-hit it on every request.
+  { provider: "opencode", text: "free usage limit reached", cooldownMs: 30 * 60 * 1000 },
   // NVIDIA NIM returns 400 with "degraded" when specific model cluster is unhealthy.
   // Lock only the degraded model (modelScoped: true) without locking the API key.
   { provider: "nvidia", text: "degraded", cooldownMs: 15 * 60 * 1000, modelScoped: true },
